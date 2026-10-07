@@ -1,4 +1,4 @@
 interface:
   display_name: "磁盘空间统计"
   short_description: "只读统计磁盘各层文件夹占用大小并生成 Excel 分析报表"
-  default_prompt: "统计 C 盘第一二层文件夹大小，对占比前 2 的文件夹深入统计第三四层，生成 Excel 报表"
+  default_prompt: "统计 C 盘第一二层文件夹大小，对占比前 2 的文件夹深入统计第三至第六层，每个父目录仅保留子目录 Top10，生成 Excel 报表"

@@ -53,7 +53,7 @@ def rows_of(items, root=None):
         p = it.get("Path", "")
         if root and p.startswith(root):
             p = p[len(root):].lstrip("\\")
-        out.append([p, it.get("SizeGB", 0), it.get("FileCount", 0)])
+        out.append([p, it.get("SizeGB", 0), it.get("FileCount", 0), it.get("SizeBytes")])
     return out
 
 
@@ -94,25 +94,24 @@ def main():
 
     root = root_label.rstrip("\\") + "\\"
     wb = Workbook()
-    make_sheet(wb.active, "第一层", ["路径", "大小(GB)", "文件数"], rows_of(data.get("Level1")))
+    headers = ["路径", "大小(GB)", "文件数", "实际大小(Bytes)"]
+    make_sheet(wb.active, "第一层", headers, rows_of(data.get("Level1")))
 
     ws2 = wb.create_sheet()
-    make_sheet(ws2, "第二层", ["路径", "大小(GB)", "文件数"], rows_of(data.get("Level2")))
+    make_sheet(ws2, "第二层", headers, rows_of(data.get("Level2")))
 
     deep = data.get("Deep") or []
-    l3_rows, l4_rows = [], []
-    for d in deep:
-        top = d["TopPath"]
-        for it in d.get("Level3") or []:
-            l3_rows.append([it["Path"], it["SizeGB"], it["FileCount"], top])
-        for it in d.get("Level4") or []:
-            l4_rows.append([it["Path"], it["SizeGB"], it["FileCount"], top])
-    ws3 = wb.create_sheet()
-    make_sheet(ws3, "第三层(深度分析)", ["路径", "大小(GB)", "文件数", "所属Top目录"], l3_rows)
-    ws4 = wb.create_sheet()
-    make_sheet(ws4, "第四层(深度分析)", ["路径", "大小(GB)", "文件数", "所属Top目录"], l4_rows)
+    for depth, label in [(3, "第三层"), (4, "第四层"), (5, "第五层"), (6, "第六层")]:
+        rows = []
+        for detail in deep:
+            rows.extend(row + [detail["TopPath"]]
+                        for row in rows_of(detail.get("Level{0}".format(depth))))
+        make_sheet(wb.create_sheet(), label + "(深度分析)", headers + ["所属Top目录"], rows)
 
-    total = round(sum(it.get("SizeGB", 0) for it in data.get("Level1") or []), 2)
+    total = (round(data["Level1TotalBytes"] / (1024 ** 3), 2)
+             if data.get("Level1TotalBytes") is not None else
+             data.get("Validation", {}).get("Level1TotalGB",
+                 round(sum(it.get("SizeGB", 0) for it in data.get("Level1") or []), 2)))
     val = data.get("Validation") or {}
     verdict = val.get("Verdict", "unknown")
     warn_rows = []
@@ -129,7 +128,7 @@ def main():
     summary_rows = [
         ["统计根目录", root_label],
         ["生成时间", data.get("GeneratedAt", "")],
-        ["第一层总大小(GB)", total],
+        ["第一层全量总大小(GB)", total],
     ]
     if val.get("Checked"):
         summary_rows += [
@@ -137,8 +136,12 @@ def main():
             ["覆盖率(%)", val.get("CoveragePct")],
         ]
     summary_rows += [
-        ["第一层文件夹数", len(data.get("Level1") or [])],
-        ["第二层文件夹数", len(data.get("Level2") or [])],
+        ["第一层全量文件夹数", data.get("Level1FolderCount", len(data.get("Level1") or []))],
+        ["第一层展示文件夹数", len(data.get("Level1") or [])],
+        ["第二层展示文件夹数", len(data.get("Level2") or [])],
+        ["筛选口径", "每个父目录分别保留 Top{0}，沿保留目录展开".format(data["PerParentLimit"])
+         if data.get("PerParentLimit") else "旧版全量展示"],
+        ["大小口径", "GB 四舍五入显示；父子大小合计请核对实际大小(Bytes)列"],
         ["深度分析目录", ", ".join(d["TopPath"] for d in deep)],
     ]
     make_sheet(ws5, "汇总", ["项目", "值"], summary_rows)

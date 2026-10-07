@@ -1,11 +1,11 @@
 ﻿<#
 .SYNOPSIS
-  只读统计磁盘目录大小（第 1~4 层），输出 JSON。
+  只读统计磁盘目录大小（第 1~6 层），输出 JSON。
 .DESCRIPTION
   阶段零：权限自检。探测当前用户 AppData 等受保护目录是否可读；
           不可读说明会话为受限权限，统计必然偏小，告警并以退出码 2 中止（可用 -Force 强制继续）。
   阶段一：统计 Root 下第一层、第二层文件夹的递归大小。
-  阶段二：取第一层中占比最大的前 TopN 个文件夹，统计其第三层、第四层。
+  阶段二：取第一层中占比最大的前 TopN 个文件夹，统计其第三层至第六层；每个父目录分别保留 Top10。
   全程仅读取，不写入/删除任何被统计目录中的内容。
 .PARAMETER Root
   统计根目录，默认 C:\（本机系统盘盘符，可改为其他盘或目录）。
@@ -24,7 +24,7 @@
 param(
     [string]$Root = 'C:\',
     [string]$OutJson,
-    [int]$TopN = 2,
+    [ValidateRange(1, 10)][int]$TopN = 2,
     [switch]$Force
 )
 
@@ -150,57 +150,83 @@ Write-Host "权限自检通过：$($probeResults.Count) 个探测点无完全不
 
 function Get-DirSize {
     param([string]$Path)
-    $files = Get-ChildItem -Path $Path -Recurse -File -Force -ErrorAction SilentlyContinue
-    $sum = ($files | Measure-Object -Property Length -Sum).Sum
-    if ($null -eq $sum) { $sum = 0 }
-    return [PSCustomObject]@{
-        Path      = $Path
-        SizeGB    = [math]::Round($sum / 1GB, 2)
-        FileCount = $files.Count
+    if ($null -eq $script:SizeCache) {
+        $script:SizeCache = @{}
+        $script:ChildrenCache = @{}
     }
+    if ($script:SizeCache.ContainsKey($Path)) { return $script:SizeCache[$Path] }
+    [long]$sum = 0
+    [long]$count = 0
+    $children = @()
+    foreach ($entry in (Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
+        if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+        if ($entry.PSIsContainer) {
+            $child = Get-DirSize $entry.FullName
+            $children += $child
+            $sum += $child.SizeBytes
+            $count += $child.FileCount
+        } else {
+            $sum += $entry.Length
+            $count++
+        }
+    }
+    $stat = [PSCustomObject]@{
+        Path      = $Path
+        SizeBytes = $sum
+        SizeGB    = [math]::Round($sum / 1GB, 2)
+        FileCount = $count
+    }
+    $script:SizeCache[$Path] = $stat
+    $script:ChildrenCache[$Path] = $children
+    return $stat
 }
 
 function Get-SubDirSizes {
     param([string]$Path)
-    $result = @()
-    Get-ChildItem -Path $Path -Directory -Force -ErrorAction SilentlyContinue |
-        Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) } |
-        ForEach-Object { $result += Get-DirSize $_.FullName }
-    return $result | Sort-Object SizeGB -Descending
+    $null = Get-DirSize $Path
+    $result = $script:ChildrenCache[$Path]
+    return $result | Sort-Object @{Expression='SizeBytes';Descending=$true}, Path
+}
+
+function Select-TopDirs {
+    param([object[]]$Items)
+    return $Items | Sort-Object @{Expression='SizeBytes';Descending=$true}, Path | Select-Object -First 10
 }
 
 Write-Host "[1/2] 统计第一层、第二层: $Root"
-$level1 = @(Get-SubDirSizes $Root)
+$allLevel1 = @(Get-SubDirSizes $Root)
+$level1 = @(Select-TopDirs $allLevel1)
 
 $level2 = @()
 foreach ($d in $level1) {
     Write-Host "  进入 $($d.Path)"
-    $level2 += @(Get-SubDirSizes $d.Path)
+    $level2 += @(Select-TopDirs @(Get-SubDirSizes $d.Path))
 }
-$level2 = @($level2 | Sort-Object SizeGB -Descending)
+$level2 = @($level2 | Sort-Object @{Expression='SizeBytes';Descending=$true}, Path)
 
-Write-Host "[2/2] 深度分析前 $TopN 个文件夹（第三层、第四层）"
+Write-Host "[2/2] 深度分析前 $TopN 个文件夹（第三层至第六层）"
 $deep = @()
-$tops = @($level1 | Select-Object -First $TopN)
+$tops = @($allLevel1 | Select-Object -First $TopN)
 foreach ($top in $tops) {
     Write-Host "  深入 $($top.Path)"
-    $level3 = @(Get-SubDirSizes $top.Path)
-    $level4 = @()
-    foreach ($d3 in $level3) {
-        Write-Host "    进入 $($d3.Path)"
-        $level4 += @(Get-SubDirSizes $d3.Path)
+    $detail = [ordered]@{ TopPath = $top.Path }
+    $parents = @(Select-TopDirs @(Get-SubDirSizes $top.Path))
+    foreach ($depth in 3..6) {
+        $children = @()
+        foreach ($parent in $parents) {
+            $children += @(Select-TopDirs @(Get-SubDirSizes $parent.Path))
+        }
+        $detail["Level$depth"] = @($children | Sort-Object @{Expression='SizeBytes';Descending=$true}, Path)
+        $parents = $children
     }
-    $deep += [PSCustomObject]@{
-        TopPath = $top.Path
-        Level3  = $level3
-        Level4  = @($level4 | Sort-Object SizeGB -Descending)
-    }
+    $deep += [PSCustomObject]$detail
 }
 
 # ---- 阶段三：与磁盘真实占用交叉验证 ----
 # 权限退化时脚本仍可能"成功"退出，但统计值远小于真实占用。
 # 用 Win32_LogicalDisk 取 Root 所在盘真实已用容量做基准，偏差过大直接判定结果不可用。
-$totalGB = [math]::Round((($level1 | Measure-Object -Property SizeGB -Sum).Sum), 2)
+$totalBytes = ($allLevel1 | Measure-Object -Property SizeBytes -Sum).Sum
+$totalGB = [math]::Round($totalBytes / 1GB, 2)
 $validation = [PSCustomObject]@{
     Checked          = $false
     Level1TotalGB    = $totalGB
@@ -258,6 +284,10 @@ if ($validation.Checked) {
 $report = [PSCustomObject]@{
     Root        = $Root
     GeneratedAt = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    PerParentLimit = 10
+    MaxDepth = 6
+    Level1TotalBytes = $totalBytes
+    Level1FolderCount = $allLevel1.Count
     Level1      = $level1
     Level2      = $level2
     Deep        = $deep
